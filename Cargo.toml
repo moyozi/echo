@@ -1,0 +1,17 @@
+[package]
+name = "echo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix = "0.13.5"
+actix-web = "4.12.1"
+actix-web-actors = "4.3.1"
+env_logger = "0.11.8"
+mediasoup = "0.20.0"
+serde = "1.0.228"
+serde_json = "1.0.149"
+
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
