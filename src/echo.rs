@@ -1,14 +1,21 @@
 use actix::prelude::*;
 use actix_web::web::{Data, Payload};
-use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
 use actix_web_actors::ws;
 use mediasoup::prelude::*;
+use mediasoup::types::sctp_parameters::SctpParameters;
 use mediasoup::worker::{WorkerLogLevel, WorkerLogTag};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::num::{NonZeroU32, NonZeroU8};
+use std::num::{NonZeroU8, NonZeroU32};
+use std::time::{Duration, Instant};
 
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long before lack of client response causes a timeout
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(50);
 /// List of codecs that SFU will accept from clients
 fn media_codecs() -> Vec<RtpCodecCapability> {
     vec![
@@ -45,6 +52,7 @@ struct TransportOptions {
     dtls_parameters: DtlsParameters,
     ice_candidates: Vec<IceCandidate>,
     ice_parameters: IceParameters,
+    sctp_parameters: Option<SctpParameters>,
 }
 
 /// Server messages sent to the client
@@ -60,6 +68,7 @@ enum ServerMessage {
         consumer_transport_options: TransportOptions,
         producer_transport_options: TransportOptions,
         router_rtp_capabilities: RtpCapabilitiesFinalized,
+        data_producer_id: DataProducerId,
     },
     /// Notification that producer transport was connected successfully (in case of error connection
     /// is just dropped, in real-world application you probably want to handle it better)
@@ -79,6 +88,15 @@ enum ServerMessage {
         producer_id: ProducerId,
         kind: MediaKind,
         rtp_parameters: RtpParameters,
+    },
+
+    #[serde(rename_all = "camelCase")]
+    DataConsumed {
+        id: DataConsumerId,
+        data_producer_id: DataProducerId,
+        lable: String,
+        protocol: String,
+        sctp_stream_parameters: Option<SctpStreamParameters>,
     },
 }
 
@@ -109,6 +127,13 @@ enum ClientMessage {
     /// Request to resume consumer that was previously created
     #[serde(rename_all = "camelCase")]
     ConsumerResume { id: ConsumerId },
+
+    /// Request to consume specified producer
+    #[serde(rename_all = "camelCase")]
+    DataConsume { data_producer_id: DataProducerId },
+    /// Request to resume consumer that was previously created
+    #[serde(rename_all = "camelCase")]
+    DataConsumerResume { id: DataConsumerId },
 }
 
 /// Internal actor messages for convenience
@@ -119,6 +144,7 @@ enum InternalMessage {
     SaveProducer(Producer),
     /// Save consumer in connection-specific hashmap to prevent it from being destroyed
     SaveConsumer(Consumer),
+    SaveDataConsumer(DataConsumer),
     /// Stop/close the WebSocket connection
     Stop,
 }
@@ -138,12 +164,17 @@ struct EchoConnection {
     client_rtp_capabilities: Option<RtpCapabilities>,
     /// Consumers associated with this client, preventing them from being destroyed
     consumers: HashMap<ConsumerId, Consumer>,
+    data_consumers: HashMap<DataConsumerId, DataConsumer>,
     /// Producers associated with this client, preventing them from being destroyed
     producers: Vec<Producer>,
     /// Router associated with this client, useful to get its RTP capabilities later
     router: Router,
     /// Consumer and producer transports associated with this client
     transports: Transports,
+    direct: DirectTransport,
+    data_producer: DataProducer,
+
+    pub hb: Instant,
 }
 
 impl EchoConnection {
@@ -181,7 +212,7 @@ impl EchoConnection {
         // We know that for echo example we'll need 2 transports, so we can create both right away.
         // This may not be the case for real-world applications or you may create this at a
         // different time and/or in different order.
-        let transport_options =
+        let mut transport_options =
             WebRtcTransportOptions::new(WebRtcTransportListenInfos::new(ListenInfo {
                 protocol: Protocol::Udp,
                 ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -193,6 +224,7 @@ impl EchoConnection {
                 send_buffer_size: None,
                 recv_buffer_size: None,
             }));
+        transport_options.enable_sctp = true;
         let producer_transport = router
             .create_webrtc_transport(transport_options.clone())
             .await
@@ -202,17 +234,53 @@ impl EchoConnection {
             .create_webrtc_transport(transport_options)
             .await
             .map_err(|error| format!("Failed to create consumer transport: {error}"))?;
+        let direct_transport = router
+            .create_direct_transport(DirectTransportOptions::default())
+            .await
+            .map_err(|error| format!("Failed to create direct transport: {error}"))?;
+        let opt = DataProducerOptions::new_direct();
+        let data_producer = direct_transport
+            .produce_data(opt)
+            .await
+            .map_err(|error| format!("Faild to create direct producer :{error}"))?;
 
         Ok(Self {
+            hb: Instant::now(),
             client_rtp_capabilities: None,
             consumers: HashMap::new(),
+            data_consumers: HashMap::new(),
             producers: vec![],
             router,
             transports: Transports {
                 consumer: consumer_transport,
                 producer: producer_transport,
             },
+            direct: direct_transport,
+            data_producer,
         })
+    }
+
+    fn hb(&self, ctx: &mut ws::WebsocketContext<Self>) {
+        ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
+            // check client heartbeats
+            if Instant::now().duration_since(act.hb) > CLIENT_TIMEOUT {
+                ctx.address().do_send(InternalMessage::Stop);
+                return;
+            }
+
+            let direct = match &act.data_producer {
+                DataProducer::Direct(d) => d.clone(),
+                _ => panic!("Expected DirectDataProducer, got Regular"),
+            };
+
+            let msg = "你好，这是来自 Rust 的消息！";
+            let x = direct.send(
+                WebRtcMessage::String(Cow::Borrowed(msg.as_bytes())),
+                None,
+                None,
+            );
+            ctx.ping(b"");
+        });
     }
 }
 
@@ -221,7 +289,7 @@ impl Actor for EchoConnection {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         println!("WebSocket connection created");
-
+        self.hb(ctx);
         // We know that both consumer and producer transports will be used, so we sent server
         // information about both in an initialization message alongside with router capabilities
         // to the client right after WebSocket connection is established
@@ -231,14 +299,17 @@ impl Actor for EchoConnection {
                 dtls_parameters: self.transports.consumer.dtls_parameters(),
                 ice_candidates: self.transports.consumer.ice_candidates().clone(),
                 ice_parameters: self.transports.consumer.ice_parameters().clone(),
+                sctp_parameters: self.transports.consumer.sctp_parameters().clone(),
             },
             producer_transport_options: TransportOptions {
                 id: self.transports.producer.id(),
                 dtls_parameters: self.transports.producer.dtls_parameters(),
                 ice_candidates: self.transports.producer.ice_candidates().clone(),
                 ice_parameters: self.transports.producer.ice_parameters().clone(),
+                sctp_parameters: None,
             },
             router_rtp_capabilities: self.router.rtp_capabilities().clone(),
+            data_producer_id: self.data_producer.id(),
         };
 
         ctx.address().do_send(server_init_message);
@@ -255,10 +326,13 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for EchoConnection {
         // messages since we know all messages will fit into a single frame, but in real-world apps
         // you need to handle continuation frames too (`ws::Message::Continuation`)
         match msg {
-            Ok(ws::Message::Ping(msg)) => {
-                ctx.pong(&msg);
+            Ok(ws::Message::Ping(m)) => {
+                self.hb = Instant::now();
+                ctx.pong(&m);
             }
-            Ok(ws::Message::Pong(_)) => {}
+            Ok(ws::Message::Pong(_)) => {
+                self.hb = Instant::now();
+            }
             Ok(ws::Message::Text(text)) => match serde_json::from_str::<ClientMessage>(&text) {
                 Ok(message) => {
                     // Parse JSON into an enum and just send it back to the actor to be processed
@@ -424,6 +498,54 @@ impl Handler<ClientMessage> for EchoConnection {
                     });
                 }
             }
+            ClientMessage::DataConsume { data_producer_id } => {
+                let address = ctx.address();
+                let transport = self.transports.consumer.clone();
+                actix::spawn(async move {
+                    let mut options = DataConsumerOptions::new_direct(data_producer_id, None);
+                    options.paused = true;
+
+                    match transport.consume_data(options).await {
+                        Ok(consumer) => {
+                            let id = consumer.id();
+
+                            address.do_send(ServerMessage::DataConsumed {
+                                id,
+                                data_producer_id,
+                                lable: consumer.label().to_string(),
+                                protocol: consumer.protocol().to_string(),
+                                sctp_stream_parameters: consumer.sctp_stream_parameters(),
+                            });
+                            // Consumer is stored in a hashmap since if we don't do it, it will get
+                            // destroyed as soon as its instance goes out out scope
+                            address.do_send(InternalMessage::SaveDataConsumer(consumer));
+                            println!(" consumer created: {id}");
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to create consumer: {error}");
+                            address.do_send(InternalMessage::Stop);
+                        }
+                    }
+                });
+            }
+            ClientMessage::DataConsumerResume { id } => {
+                let direct = match &self.data_producer {
+                    DataProducer::Direct(d) => d.clone(),
+                    _ => panic!("Expected DirectDataProducer, got Regular"),
+                };
+                if let Some(consumer) = self.data_consumers.get(&id).cloned() {
+                    actix::spawn(async move {
+                        match consumer.resume().await {
+                            Ok(_) => {
+                                println!("Successfully resumed  consumer {}", consumer.id(),);
+                            }
+                            Err(error) => {
+                                println!("Failed to resume  consumer {}: {}", consumer.id(), error,);
+                            }
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -455,6 +577,10 @@ impl Handler<InternalMessage> for EchoConnection {
             }
             InternalMessage::SaveConsumer(consumer) => {
                 self.consumers.insert(consumer.id(), consumer);
+            }
+            InternalMessage::SaveDataConsumer(data_consumer) => {
+                self.data_consumers
+                    .insert(data_consumer.id(), data_consumer);
             }
         }
     }

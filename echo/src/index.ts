@@ -1,19 +1,21 @@
 /* eslint-disable no-console */
 import { Device } from 'mediasoup-client';
-import { type MediaKind, type RtpCapabilities, type RtpParameters } from 'mediasoup-client/types';
+import { type DataConsumer, type MediaKind, type RtpCapabilities, type RtpParameters } from 'mediasoup-client/types';
 import { type DtlsParameters, type TransportOptions, type Transport } from 'mediasoup-client/types';
-import { type ConsumerOptions } from 'mediasoup-client/types';
+import { type DataConsumerOptions } from 'mediasoup-client/types';
 
 type Brand<K, T> = K & { __brand: T };
 
 type ConsumerId = Brand<string, 'ConsumerId'>;
 type ProducerId = Brand<string, 'ProducerId'>;
-
+type DataProducerId = Brand<string, 'DataProducerId'>;
+type DataConsumerId = Brand<string, 'DataDataConsumerId'>;
 interface ServerInit {
   action: 'Init';
   consumerTransportOptions: TransportOptions;
   producerTransportOptions: TransportOptions;
   routerRtpCapabilities: RtpCapabilities;
+  dataProducerId: DataProducerId;
 }
 
 interface ServerConnectedProducerTransport {
@@ -36,12 +38,17 @@ interface ServerConsumed {
   rtpParameters: RtpParameters;
 }
 
+interface ServerDataConsumed {
+  action: 'DataConsumed';
+  id: DataConsumerId;
+  dataProducerId: DataProducerId;
+}
 type ServerMessage =
   ServerInit |
   ServerConnectedProducerTransport |
   ServerProduced |
   ServerConnectedConsumerTransport |
-  ServerConsumed;
+  ServerConsumed | ServerDataConsumed;
 
 interface ClientInit {
   action: 'Init';
@@ -73,6 +80,15 @@ interface ClientConsumerResume {
   action: 'ConsumerResume';
   id: ConsumerId;
 }
+interface ClientDataConsume {
+  action: 'DataConsume';
+  dataProducerId: DataProducerId;
+}
+
+interface ClientDataConsumerResume {
+  action: 'DataConsumerResume';
+  id: DataConsumerId;
+}
 
 type ClientMessage =
   ClientInit |
@@ -80,7 +96,7 @@ type ClientMessage =
   ClientProduce |
   ClientConnectConsumerTransport |
   ClientConsume |
-  ClientConsumerResume;
+  ClientConsumerResume | ClientDataConsume | ClientDataConsumerResume;
 
 async function init() {
   const sendPreview = document.querySelector('#preview-send') as HTMLVideoElement;
@@ -93,7 +109,7 @@ async function init() {
     receivePreview.play();
   };
 
-  const receiveMediaStream = new MediaStream();
+  //  const receiveMediaStream = new MediaStream();
 
   const ws = new WebSocket('ws://localhost:3000/ws');
 
@@ -104,7 +120,7 @@ async function init() {
   const device = new Device();
   let producerTransport: Transport | undefined;
   let consumerTransport: Transport | undefined;
-
+  let dataConsumer: DataConsumer;
   {
     const waitingForResponse: Map<ServerMessage['action'], Function> = new Map();
 
@@ -118,6 +134,7 @@ async function init() {
           await device.load({
             routerRtpCapabilities: decodedMessage.routerRtpCapabilities
           });
+          console.log(decodedMessage.dataProducerId);
 
           // Send client-side initialization message back right away
           send({
@@ -212,39 +229,45 @@ async function init() {
 
           // For simplicity of this example producers were stored in an array
           // and are now all consumed one at a time
-          for (const producer of producers) {
-            await new Promise((resolve) => {
-              // Send request to consume producer
-              send({
-                action: 'Consume',
-                producerId: producer.id as ProducerId
-              });
-              // And wait for confirmation, but, obviously, no error handling,
-              // which you should definitely have in real-world applications
-              waitingForResponse.set('Consumed', async (consumerOptions: ConsumerOptions) => {
-                // Once confirmation is received, corresponding consumer
-                // can be created client-side
-                const consumer = await (consumerTransport as Transport).consume(
-                  consumerOptions
-                );
-
-                console.log(`${consumer.kind} consumer created:`, consumer);
-
-                // Consumer needs to be resumed after being created in
-                // paused state (see official documentation about why:
-                // https://mediasoup.org/documentation/v3/mediasoup/api/#transport-consume)
-                send({
-                  action: 'ConsumerResume',
-                  id: consumer.id as ConsumerId
-                });
-
-                receiveMediaStream.addTrack(consumer.track);
-                receivePreview.srcObject = receiveMediaStream;
-
-                resolve(undefined);
-              });
+          // for (const producer of producers) {
+          await new Promise((resolve) => {
+            // Send request to consume producer
+            send({
+              action: 'DataConsume',
+              dataProducerId: decodedMessage.dataProducerId
             });
-          }
+            // And wait for confirmation, but, obviously, no error handling,
+            // which you should definitely have in real-world applications
+            waitingForResponse.set('DataConsumed', async (consumerOptions: DataConsumerOptions) => {
+              // Once confirmation is received, corresponding consumer
+              // can be created client-side
+              console.log(consumerOptions)
+              dataConsumer = await (consumerTransport as Transport).consumeData(
+                consumerOptions
+              );
+
+              dataConsumer.on("message", (a) => {
+                console.log("ddd", a)
+              })
+              console.log(`${dataConsumer.dataProducerId} consumer created:`, dataConsumer);
+              dataConsumer.on("open", () => {
+                console.log("open")
+              })
+              // Consumer needs to be resumed after being created in
+              // paused state (see official documentation about why:
+              // https://mediasoup.org/documentation/v3/mediasoup/api/#transport-consume)
+              send({
+                action: 'DataConsumerResume',
+                id: dataConsumer.id as DataConsumerId
+              });
+
+              // receiveMediaStream.addTrack(consumer.track);
+              // receivePreview.srcObject = receiveMediaStream;
+
+              resolve(undefined);
+            });
+          });
+          //}
 
           break;
         }
