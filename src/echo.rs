@@ -1,3 +1,5 @@
+mod types;
+use crate::types::media_codecs;
 use actix::prelude::*;
 use actix_web::web::{Data, Payload};
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
@@ -9,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::num::{NonZeroU8, NonZeroU32};
+use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -17,31 +19,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 /// How long before lack of client response causes a timeout
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(50);
 /// List of codecs that SFU will accept from clients
-fn media_codecs() -> Vec<RtpCodecCapability> {
-    vec![
-        RtpCodecCapability::Audio {
-            mime_type: MimeTypeAudio::Opus,
-            preferred_payload_type: None,
-            clock_rate: NonZeroU32::new(48000).unwrap(),
-            channels: NonZeroU8::new(2).unwrap(),
-            parameters: RtpCodecParametersParameters::from([("useinbandfec", 1_u32.into())]),
-            rtcp_feedback: vec![RtcpFeedback::TransportCc],
-        },
-        RtpCodecCapability::Video {
-            mime_type: MimeTypeVideo::Vp8,
-            preferred_payload_type: None,
-            clock_rate: NonZeroU32::new(90000).unwrap(),
-            parameters: RtpCodecParametersParameters::default(),
-            rtcp_feedback: vec![
-                RtcpFeedback::Nack,
-                RtcpFeedback::NackPli,
-                RtcpFeedback::CcmFir,
-                RtcpFeedback::GoogRemb,
-                RtcpFeedback::TransportCc,
-            ],
-        },
-    ]
-}
 
 /// Data structure containing all the necessary information about transport options required from
 /// the server to establish transport connection on the client
@@ -214,12 +191,12 @@ impl EchoConnection {
         // different time and/or in different order.
         let mut transport_options =
             WebRtcTransportOptions::new(WebRtcTransportListenInfos::new(ListenInfo {
-                protocol: Protocol::Udp,
-                ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                announced_address: None,
+                protocol: Protocol::Tcp,
+                ip: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                announced_address: Some("10.6.5.218".to_string()),
                 expose_internal_ip: false,
                 port: None,
-                port_range: None,
+                port_range: Some(RangeInclusive::new(5170, 5172)),
                 flags: None,
                 send_buffer_size: None,
                 recv_buffer_size: None,
@@ -274,7 +251,7 @@ impl EchoConnection {
             };
 
             let msg = "你好，这是来自 Rust 的消息！";
-            let x = direct.send(
+            let _ = direct.send(
                 WebRtcMessage::String(Cow::Borrowed(msg.as_bytes())),
                 None,
                 None,
@@ -529,10 +506,6 @@ impl Handler<ClientMessage> for EchoConnection {
                 });
             }
             ClientMessage::DataConsumerResume { id } => {
-                let direct = match &self.data_producer {
-                    DataProducer::Direct(d) => d.clone(),
-                    _ => panic!("Expected DirectDataProducer, got Regular"),
-                };
                 if let Some(consumer) = self.data_consumers.get(&id).cloned() {
                     actix::spawn(async move {
                         match consumer.resume().await {
@@ -618,7 +591,7 @@ async fn main() -> std::io::Result<()> {
     })
     // 2 threads is plenty for this example, default is to have as many threads as CPU cores
     .workers(2)
-    .bind("127.0.0.1:3000")?
+    .bind("0.0.0.0:5177")?
     .run()
     .await
 }
