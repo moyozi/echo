@@ -52,6 +52,8 @@ type Room struct{
   RecvRouters:Vec<Router> 
   Producers:HashMap<PeerId,Vec<Producer>>
   Piped: HashSet<(ProdcuerId,RouterId)>
+  DataProducer:DirectDataProducer
+  DirectTransport:DirectTransport
 }
 
 type Peer struct{
@@ -64,6 +66,7 @@ type Peer struct{
   ConsumerTransport:WebRtcTransport
   Producers:HashMap<ProducerId,Producer>
   Consumers:HashMap<ConsumerId,Consumer>
+  DataConsumer: DataConsumer
 }
 
 ```
